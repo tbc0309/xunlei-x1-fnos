@@ -7,7 +7,7 @@
 在 Linux 或 WSL 安装 `dpkg-dev` 和 `kmod`。下载 Release 的 DEB 后执行：
 
 ```bash
-bash build-deb.sh ./lshz-3399-dsi-timing_0.2~beta3+fix1_arm64.deb ./rebuilt.deb
+bash build-deb.sh ./lshz-3399-dsi-timing_0.2.beta3+fix1_arm64.deb ./rebuilt.deb
 ```
 
 脚本解包参考 DEB，覆盖 `src/` 中对应的可维护文件，检查六个模块的 vermagic，重建校验清单并打包。发布更新时同时更新 DEB 版本，避免包管理器把新版识别成同一版本。
