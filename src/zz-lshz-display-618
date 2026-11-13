@@ -1,0 +1,24 @@
+#!/bin/sh
+set -eu
+[ "${1:-}" != prereqs ] || exit 0
+[ "$version" = 6.18.18.c1202-trim ] || exit 0
+grep -azqx 'lshz,rk3399' /proc/device-tree/compatible 2>/dev/null || exit 0
+
+# A kernel upgrade can create modules.dep before the board overrides apply.
+depmod -a "$version"
+for module in dw_mipi_dsi rockchipdrm panel_rk3399_640x480; do
+    file=$(modinfo -k "$version" -n "$module")
+    case "$file" in
+        */updates/lshz-beta3/*.ko) ;;
+        *) echo "LSHZ: unexpected $module path: $file" >&2; exit 1 ;;
+    esac
+done
+. /usr/share/initramfs-tools/hook-functions
+force_load dw_mipi_dsi
+force_load rockchipdrm
+force_load panel_rk3399_640x480
+for module in dw-mipi-dsi rockchipdrm panel-rk3399-640x480; do
+    test -f "$DESTDIR/lib/modules/$version/updates/lshz-beta3/$module.ko"
+    find "$DESTDIR/lib/modules/$version" -type f -name "$module.ko*" \
+        ! -path '*/updates/lshz-beta3/*' -delete
+done

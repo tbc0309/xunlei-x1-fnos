@@ -1,0 +1,40 @@
+#!/bin/sh
+set -eu
+[ "$1" = configure ] || exit 0
+[ -z "${DPKG_ROOT:-}" ] || exit 0
+grep -azqx 'lshz,rk3399' /proc/device-tree/compatible 2>/dev/null || exit 0
+for abi in 6.12.41-trim 6.18.18.c1202-trim; do
+    [ -f "/lib/modules/$abi/modules.builtin" ] || continue
+    depmod -a "$abi"
+    initrd="/boot/initrd.img-$abi"
+    wrapped="/boot/uInitrd-$abi"
+    [ -f "$initrd" ] && [ -f "$wrapped" ] || continue
+    mountpoint -q /boot
+    stage=$(mktemp -d /boot/.lshz-initrd.XXXXXX)
+    trap 'rm -f "$stage/initrd" "$stage/uInitrd" "$stage/list"; rmdir "$stage"' EXIT
+    mkinitramfs -o "$stage/initrd" "$abi"
+    lsinitramfs "$stage/initrd" > "$stage/list"
+    for module in rockchipdrm dw-mipi-dsi panel-rk3399-640x480; do
+        grep -F "updates/lshz-beta3/$module.ko" "$stage/list"
+        if [ "$abi" = 6.18.18.c1202-trim ]; then
+            count=$(grep -Ec "/$module\.ko(\.[^/]*)?$" "$stage/list")
+            test "$count" -eq 1
+        fi
+    done
+    mkimage -A arm64 -O linux -T ramdisk -C gzip -n uInitrd -d "$stage/initrd" "$stage/uInitrd"
+    tail -c +65 "$stage/uInitrd" | cmp "$stage/initrd" -
+    backup=$(mktemp -d /boot/.lshz-prepatch.XXXXXX)
+    cp -a "$initrd" "$wrapped" "$backup/"
+    mv -f "$stage/initrd" "$initrd"
+    if ! mv -f "$stage/uInitrd" "$wrapped"; then
+        cp -a "$backup/${initrd##*/}" "$initrd"
+        exit 1
+    fi
+    sync
+    rm -f "$stage/list"
+    rmdir "$stage"
+    trap - EXIT
+done
+if systemctl is-active --quiet lshz-board-display.service; then
+    systemctl restart lshz-board-display.service
+fi

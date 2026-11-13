@@ -1,0 +1,75 @@
+#!/usr/bin/env python3
+import fcntl
+import os
+from pathlib import Path
+import struct
+import time
+
+
+def publish_state(running):
+    directory = Path('/run/lshz')
+    pending = directory / 'fan-state.tmp'
+    pending.write_text(f'{int(running)}\n', encoding='ascii')
+    pending.replace(directory / 'fan-state')
+
+
+def next_state(running, temperature):
+    if temperature is None:
+        return True
+    return temperature > 55000 if running else temperature >= 60000
+
+
+def temperature():
+    for zone in sorted(Path('/sys/class/thermal').glob('thermal_zone*')):
+        try:
+            if (zone / 'type').read_text().strip() in ('soc-thermal', 'cpu-thermal'):
+                value = int((zone / 'temp').read_text())
+                if -40000 <= value <= 150000:
+                    return value
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def open_fan(initial):
+    for device in sorted(Path('/dev').glob('gpiochip*')):
+        with device.open('rb', buffering=0) as chip:
+            info = bytearray(68)
+            fcntl.ioctl(chip, 0x8044B401, info, True)
+            if info[32:64].split(b'\0', 1)[0] != b'gpio1':
+                continue
+            # GPIO1_C6 is line 22 on GPIO bank 1.
+            request = bytearray(struct.pack('=64II64s32sIi', 22, *([0] * 63),
+                                            2, bytes([initial]), b'lshz-fan', 1, 0))
+            fcntl.ioctl(chip, 0xC16CB403, request, True)
+            return struct.unpack_from('=i', request, 360)[0]
+    raise RuntimeError('GPIO bank gpio1 unavailable')
+
+
+def main():
+    compatible = Path('/proc/device-tree/compatible').read_bytes().split(b'\0')
+    if b'lshz,rk3399' not in compatible:
+        raise SystemExit('This controller requires the LSHZ RK3399 device tree')
+    reading = temperature()
+    running = next_state(False, reading)
+    fd = open_fan(running)
+    try:
+        publish_state(running)
+        print(f'fan={int(running)} temperature_mC={reading}', flush=True)
+        while True:
+            time.sleep(10)
+            reading = temperature()
+            desired = next_state(running, reading)
+            if desired != running:
+                values = bytearray(64)
+                values[0] = desired
+                fcntl.ioctl(fd, 0xC040B409, values, True)
+                running = desired
+                publish_state(running)
+                print(f'fan={int(running)} temperature_mC={reading}', flush=True)
+    finally:
+        os.close(fd)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,162 @@
+#!/usr/bin/python3
+import fcntl
+import os
+import selectors
+import struct
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+SCREEN = Path("/sys/class/backlight/backlight/bl_power")
+IDLE = 600.0
+DOUBLE = 0.30
+HOLD = 3.0
+DEBOUNCE = 0.035
+
+
+class Button:
+    def __init__(self, now, screen_on, pressed, action):
+        self.on = screen_on
+        self.constant = False
+        self.deadline = now + IDLE if screen_on else None
+        self.pressed = pressed
+        self.held_since = None
+        self.click_due = None
+        self.action = action
+
+    def screen(self, now, on, constant=False):
+        self.action("on" if on else "off")
+        self.on = on
+        self.constant = constant
+        self.deadline = now + IDLE if on and not constant else None
+
+    def edge(self, now, pressed):
+        if pressed == self.pressed:
+            return
+        self.tick(now)
+        self.pressed = pressed
+        if pressed:
+            self.held_since = now
+            return
+        if self.held_since is None:
+            return
+        self.held_since = None
+        if self.click_due is not None:
+            self.click_due = None
+            self.screen(now, True, constant=True)
+        else:
+            self.click_due = now + DOUBLE
+
+    def tick(self, now):
+        if self.held_since is not None and now >= self.held_since + HOLD:
+            self.held_since = self.click_due = None
+            self.action("shutdown")
+        if self.click_due is not None and not self.pressed and now >= self.click_due:
+            self.click_due = None
+            self.screen(now, not self.on)
+        if self.deadline is not None and now >= self.deadline:
+            self.screen(now, False)
+
+    def next_due(self):
+        return min(
+            self.held_since + HOLD if self.held_since is not None else float("inf"),
+            self.click_due if self.click_due is not None and not self.pressed else float("inf"),
+            self.deadline if self.deadline is not None else float("inf"),
+        )
+
+
+def open_button():
+    chip = os.open("/dev/gpiochip0", os.O_RDONLY | os.O_CLOEXEC)
+    try:
+        info = bytearray(68)
+        fcntl.ioctl(chip, 0x8044B401, info, True)
+        if info[32:64].split(b"\0", 1)[0] != b"gpio0":
+            raise RuntimeError("Unexpected GPIO chip label")
+        request = bytearray(struct.pack("=III32si", 5, 1 | (1 << 5), 3, b"lshz-screen-key", 0))
+        fcntl.ioctl(chip, 0xC030B404, request, True)
+        return struct.unpack_from("=i", request, 44)[0]
+    finally:
+        os.close(chip)
+
+
+def pressed(fd):
+    values = bytearray(64)
+    fcntl.ioctl(fd, 0xC040B408, values, True)
+    return values[0] == 0
+
+
+def action(event):
+    print(f"screen-key: {event}", flush=True)
+    if event == "shutdown":
+        subprocess.run(["/usr/bin/systemctl", "--no-block", "poweroff"], check=True)
+    else:
+        SCREEN.write_text("0\n" if event == "on" else "4\n", encoding="ascii")
+
+
+def run():
+    fd = open_button()
+    with os.fdopen(fd, "rb", buffering=0) as line, selectors.DefaultSelector() as selector:
+        selector.register(line, selectors.EVENT_READ)
+        key = Button(time.monotonic(), SCREEN.read_text().strip() == "0", pressed(fd), action)
+        debounce_due = float("inf")
+        print(f"screen-key: monitoring GPIO0_A5, initial backlight {'on' if key.on else 'off'}", flush=True)
+        while True:
+            now = time.monotonic()
+            until = key.next_due() if debounce_due == float("inf") else debounce_due
+            wait = None if until == float("inf") else max(0.0, until - now)
+            if selector.select(wait):
+                if len(line.read(16)) != 16:
+                    raise RuntimeError("Incomplete GPIO edge event")
+                debounce_due = time.monotonic() + DEBOUNCE
+                continue
+            now = time.monotonic()
+            if now >= debounce_due:
+                debounce_due = float("inf")
+                key.edge(now, pressed(fd))
+            if debounce_due == float("inf"):
+                key.tick(now)
+
+
+def self_test():
+    events = []
+    key = Button(0, True, False, events.append)
+    key.tick(599)
+    assert events == []
+    key.tick(600)
+    assert events == ["off"]
+    key.edge(601, True)
+    key.edge(601.1, False)
+    key.tick(601.5)
+    assert events[-1] == "on"
+    assert key.deadline == 1201.5
+    key.edge(602, True)
+    key.edge(602.1, False)
+    key.edge(602.2, True)
+    key.edge(602.4, False)
+    assert key.constant and events[-1] == "on"
+    key.tick(1300)
+    assert key.on
+    key.edge(1301, True)
+    key.edge(1301.1, False)
+    key.tick(1301.5)
+    assert not key.on and not key.constant
+    key.edge(1302, True)
+    key.tick(1304.99)
+    assert events[-1] == "off"
+    key.tick(1305)
+    key.tick(1306)
+    key.edge(1307, False)
+    assert events.count("shutdown") == 1 and events[-1] == "shutdown"
+    held = Button(0, True, True, events.append)
+    held.tick(4)
+    held.edge(5, False)
+    assert events.count("shutdown") == 1
+    print("Gesture and 600-second timer self-test passed")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--self-test"]:
+        self_test()
+    else:
+        run()

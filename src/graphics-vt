@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+import fcntl
+import signal
+import subprocess
+
+
+def active_vt():
+    return int(subprocess.check_output(['fgconsole'], text=True))
+
+
+def main():
+    vt = 8
+    original = active_vt()
+    child = None
+    stopping = False
+
+    def stop(*_):
+        nonlocal stopping
+        stopping = True
+        if child is not None and child.poll() is None:
+            child.terminate()
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    with open(f'/dev/tty{vt}', 'rb', buffering=0) as tty:
+        try:
+            subprocess.run(['chvt', str(vt)], check=True)
+            fcntl.ioctl(tty, 0x4B3A, 1)  # KDSETMODE, KD_GRAPHICS
+            if stopping:
+                return 0
+            child = subprocess.Popen(['/usr/bin/python3', '/usr/lib/lshz-3399/status-display-beta3',
+                                      '--framebuffer', '/dev/fb0', '--zh', '--font',
+                                      '/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc'])
+            if stopping and child.poll() is None:
+                child.terminate()
+            result = child.wait()
+            return 0 if stopping else result
+        finally:
+            fcntl.ioctl(tty, 0x4B3A, 0)  # KD_TEXT
+            if active_vt() == vt:
+                subprocess.run(['chvt', str(original if original != vt else 1)], check=False)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

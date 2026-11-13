@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+from dataclasses import dataclass
+import fcntl
+from functools import lru_cache
+import ipaddress
+import json
+import mmap
+import os
+from pathlib import Path
+import re
+import shutil
+import signal
+import struct
+import subprocess
+import time
+
+from PIL import Image, ImageDraw, ImageFont
+
+WIDTH, HEIGHT = 640, 480
+GIB = 1 << 30
+
+
+@dataclass
+class Status:
+    ip: str | None = None
+    interface: str | None = None
+    speed: int | None = None
+    temperature: float | None = None
+    fan: str | None = None
+    uptime: int | None = None
+    total: int | None = None
+    used: int | None = None
+    free: int | None = None
+    pool: str | None = None
+
+
+@lru_cache(maxsize=24)
+def font(path, size):
+    return ImageFont.truetype(path, size)
+
+
+def read_soc_temperature():
+    for zone in Path("/sys/class/thermal").glob("thermal_zone*"):
+        try:
+            if (zone / "type").read_text().strip() in ("soc-thermal", "cpu-thermal"):
+                return int((zone / "temp").read_text()) / 1000
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def read_network():
+    try:
+        result = subprocess.run(["ip", "-j", "-4", "addr", "show", "up", "scope", "global"],
+                                capture_output=True, text=True, check=True, timeout=2)
+        for link in json.loads(result.stdout):
+            for address in link.get("addr_info", []):
+                ip = ipaddress.ip_address(address["local"])
+                if not (ip.is_loopback or ip.is_link_local):
+                    name = link["ifname"]
+                    speed = read_number(Path("/sys/class/net") / name / "speed")
+                    return str(ip), name, speed if speed and speed > 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        pass
+    return None, None, None
+
+
+def read_number(path):
+    try:
+        return int(float(path.read_text().split()[0]))
+    except (OSError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def mounted_pool(requested, mountinfo=None):
+    try:
+        data = Path('/proc/self/mountinfo').read_text() if mountinfo is None else mountinfo
+    except OSError:
+        return None
+    mounts = {re.sub(r'\\([0-7]{3})', lambda m: chr(int(m[1], 8)), fields[4])
+              for line in data.splitlines() if len(fields := line.split()) > 5}
+    if requested:
+        requested = os.path.abspath(requested)
+        return requested if requested in mounts else None
+    pools = [path for path in mounts if re.fullmatch(r'/vol[1-9]\d*', path)]
+    return min(pools, key=lambda path: int(path[4:]), default=None)
+
+
+def snapshot(pool, fan_state):
+    ip, interface, speed = read_network()
+    fan = read_number(fan_state)
+    status = Status(ip, interface, speed, read_soc_temperature(), {0: "off", 1: "on"}.get(fan),
+                    read_number(Path("/proc/uptime")))
+    try:
+        path = mounted_pool(pool)
+        if path:
+            status.total, status.used, status.free = shutil.disk_usage(path)
+            status.pool = path
+    except OSError:
+        pass
+    return status
+
+
+def render(status, font_path, chinese, clock=None, black_cards=False):
+    background = "#000000" if black_cards else "#0c121c"
+    card_fill = background if black_cards else "#151f2d"
+    image = Image.new("RGB", (WIDTH, HEIGHT), background)
+    draw = ImageDraw.Draw(image)
+    primary, muted = "#f1f6ff", "#a0b2ca"
+    cyan, green, amber, red = "#64d8ff", "#5be5ac", "#ffc370", "#ff8c87"
+
+    def label(xy, value, size, fill=primary, anchor="lt"):
+        draw.text(xy, value, font=font(font_path, size), fill=fill, anchor=anchor)
+
+    def localized(zh, en):
+        return zh if chinese else en
+
+    def card(bounds):
+        draw.rounded_rectangle(bounds, 16, fill=card_fill, outline="#2a3a4e")
+
+    label((24, 22), "fnOS", 30)
+    label((25, 58), localized("设备状态", "Device status"), 17, muted)
+    label((616, 25), clock or time.strftime("%H:%M"), 30, anchor="rt")
+
+    card((24, 91, 615, 247))
+    pool_title = localized("存储池", "Storage pool")
+    if status.pool:
+        pool_title += f" · {Path(status.pool).name[:20]}"
+    label((44, 110), pool_title, 21, muted)
+    if status.total:
+        fraction = min(1, max(0, status.used / status.total))
+        storage_color = red if fraction >= .95 else amber if fraction >= .85 else cyan
+        label((44, 145), f"{status.used / GIB:.1f} / {status.total / GIB:.1f} GiB", 29)
+        label((596, 144), f"{fraction:.0%}", 29, storage_color, "rt")
+        draw.rounded_rectangle((44, 189, 596, 201), 6, fill="#304259")
+        if fraction > 0:
+            draw.rounded_rectangle((44, 189, 44 + max(1, round(552 * fraction)), 201), 6, fill=storage_color)
+        available = localized("可用", "Available")
+        label((44, 216), f"{available}  {status.free / GIB:.1f} GiB", 17, muted)
+    else:
+        label((44, 159), localized("未挂载", "Not mounted"), 30, amber)
+
+    for x, title in ((24, localized("芯片温度", "SoC temp")), (225, localized("风扇", "Fans")),
+                     (426, localized("运行时间", "Uptime"))):
+        card((x, 261, x + 189, 354))
+        label((x + 17, 275), title, 17, muted)
+
+    temp = status.temperature
+    temp_color = muted if temp is None else red if temp >= 80 else amber if temp >= 65 else primary
+    label((41, 308), "—" if temp is None else f"{temp:.1f} °C", 27, temp_color)
+    fan_text, fan_color = {
+        "on": (localized("供电开启", "Powered"), green),
+        "off": (localized("供电关闭", "Off"), primary),
+    }.get(status.fan, (localized("未知", "Unknown"), muted))
+    label((242, 309), fan_text, 24, fan_color)
+    uptime = "—"
+    if status.uptime is not None:
+        hours, minutes = divmod(status.uptime // 60, 60)
+        days, hours = divmod(hours, 24)
+        uptime = f"{days}d {hours}h" if days else f"{hours}h {minutes:02}m"
+    label((443, 309), uptime, 24)
+
+    card((24, 368, 615, 456))
+    net_color = green if status.ip else amber
+    draw.ellipse((44, 388, 53, 397), fill=net_color)
+    label((64, 384), localized("局域网", "LAN"), 17, muted)
+    label((44, 414), status.ip or localized("未获得 IPv4", "No IPv4 address"), 25, primary if status.ip else amber)
+    if status.interface:
+        label((596, 384), status.interface[:16], 17, muted, "rt")
+    if status.speed:
+        label((596, 418), f"{status.speed:,} Mb/s", 19, cyan, "rt")
+    return image
+
+
+class Framebuffer:
+    def __init__(self, device):
+        self.file = open(device, "r+b", buffering=0)
+        var = bytearray(160)
+        fcntl.ioctl(self.file, 0x4600, var, True)
+        mode = struct.unpack_from("=20I", var)
+        width, height, virtual_width, virtual_height, xoffset, yoffset, bpp = mode[:7]
+        if (width, height, bpp) != (WIDTH, HEIGHT, 32) or mode[8:17] != (16, 8, 0, 8, 8, 0, 0, 8, 0):
+            raise RuntimeError("Framebuffer must be 640×480 XRGB8888")
+        if xoffset + width > virtual_width or yoffset + height > virtual_height:
+            raise RuntimeError("Invalid framebuffer offsets")
+        self.stride = int((Path("/sys/class/graphics") / Path(device).name / "stride").read_text())
+        if self.stride < 4 * virtual_width:
+            raise RuntimeError("Invalid framebuffer stride")
+        self.offset = yoffset * self.stride + xoffset * 4
+        self.packed = self.stride == WIDTH * 4 and xoffset == 0
+        self.map = mmap.mmap(self.file.fileno(), self.stride * virtual_height)
+        self.previous = None
+
+    def draw(self, image):
+        data = image.tobytes("raw", "BGRX")
+        if data == self.previous:
+            return
+        if os.uname().release == "6.18.18.c1202-trim":
+            # The DRM fbdev write path notifies scanout of the updated region.
+            if self.packed:
+                self.file.seek(self.offset)
+                if self.file.write(data) != len(data):
+                    raise OSError("Short framebuffer write")
+            else:
+                for row in range(HEIGHT):
+                    start = row * WIDTH * 4
+                    self.file.seek(self.offset + row * self.stride)
+                    if self.file.write(data[start:start + WIDTH * 4]) != WIDTH * 4:
+                        raise OSError("Short framebuffer row write")
+            self.previous = data
+            return
+        if self.packed:
+            self.map[self.offset:self.offset + len(data)] = data
+            self.previous = data
+            return
+        for row in range(HEIGHT):
+            source = row * WIDTH * 4
+            destination = self.offset + row * self.stride
+            self.map[destination:destination + WIDTH * 4] = data[source:source + WIDTH * 4]
+        self.previous = data
+
+
+def console_lines(status):
+    uptime = '—'
+    if status.uptime is not None:
+        hours, minutes = divmod(status.uptime // 60, 60)
+        days, hours = divmod(hours, 24)
+        uptime = f'{days}d {hours:02}h {minutes:02}m'
+    lines = ['  fnOS  /  NAS STATUS', f'  {time.strftime("%H:%M")}     Uptime {uptime}', '',
+             '  STORAGE', '  ' + (status.pool or 'Pool not mounted')]
+    if status.total:
+        fraction = min(1, max(0, status.used / status.total))
+        filled = round(32 * fraction)
+        lines += [f'  [{"#" * filled}{"-" * (32 - filled)}] {fraction:.0%}',
+                  f'  {status.used/GIB:.1f} used / {status.total/GIB:.1f} GiB  |  {status.free/GIB:.1f} GiB free']
+    temperature = 'Unavailable' if status.temperature is None else f'{status.temperature:.1f} C'
+    fan = {'on': 'Powered', 'off': 'Off'}.get(status.fan, 'Unknown')
+    lines += ['', '  COOLING', f'  SoC {temperature}  |  Fans {fan}', '', '  LOCAL NETWORK',
+              '  ' + (status.ip or 'No IPv4 address')]
+    if status.interface:
+        lines.append(f'  {status.interface}' + (f'  |  {status.speed} Mb/s' if status.speed else ''))
+    return lines
+
+
+def run_console(vt, pool, fan_state):
+    original = int(subprocess.check_output(['fgconsole'], text=True))
+    stopping = False
+
+    def stop(*_):
+        nonlocal stopping
+        stopping = True
+
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGINT, stop)
+    with open(f'/dev/tty{vt}', 'w', encoding='ascii', errors='replace', buffering=1) as output:
+        try:
+            output.write('\x1b[0m\x1b[?25l\x1b[2J\x1b[H')
+            output.flush()
+            subprocess.run(['chvt', str(vt)], check=True)
+            while not stopping:
+                if screen_lit():
+                    lines = console_lines(snapshot(pool, fan_state))
+                    output.write('\x1b[H' + '\r\n'.join('\x1b[2K' + line for line in lines) + '\x1b[J')
+                    output.flush()
+                for _ in range(10):
+                    if stopping:
+                        break
+                    time.sleep(0.5)
+        finally:
+            output.write('\x1b[0m\x1b[?25h\x1b[2J\x1b[H')
+            output.flush()
+            if int(subprocess.check_output(['fgconsole'], text=True)) == vt:
+                subprocess.run(['chvt', str(original if original != vt else 1)], check=False)
+
+
+def screen_lit():
+    backlight = Path('/sys/class/backlight/backlight/bl_power')
+    return not backlight.exists() or backlight.read_text().strip() == '0'
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    output = parser.add_mutually_exclusive_group(required=True)
+    output.add_argument("--preview", type=Path)
+    output.add_argument("--framebuffer")
+    output.add_argument('--console', type=int, choices=range(7, 13), metavar='VT')
+    parser.add_argument("--pool", help="mount point; defaults to the first mounted /volN pool")
+    parser.add_argument("--fan-state", type=Path, default=Path("/run/lshz/fan-state"))
+    parser.add_argument("--demo", choices=("normal", "attention"))
+    parser.add_argument("--font")
+    parser.add_argument("--zh", action="store_true")
+    parser.add_argument('--black-cards', action='store_true')
+    args = parser.parse_args()
+    if args.console is not None:
+        if args.demo:
+            parser.error('--demo requires --preview')
+        run_console(args.console, args.pool, args.fan_state)
+        return
+    if not args.font:
+        parser.error('--font is required for image rendering')
+    if args.preview:
+        if args.demo == "normal":
+            status = Status("192.168.9.200", "end0", 1000, 42.5, "off", 192330,
+                            238 * GIB, 72 * GIB, 166 * GIB, "/vol1")
+        elif args.demo == "attention":
+            status = Status(temperature=68.2, fan="on", uptime=4812,
+                            total=238 * GIB, used=229 * GIB, free=9 * GIB, pool="/vol1")
+        else:
+            status = snapshot(args.pool, args.fan_state)
+        render(status, args.font, args.zh, "15:46" if args.demo else None, args.black_cards).save(args.preview)
+        return
+    if args.demo:
+        parser.error("--demo requires --preview")
+    screen = Framebuffer(args.framebuffer)
+    while True:
+        if screen_lit():
+            screen.draw(render(snapshot(args.pool, args.fan_state), args.font, args.zh,
+                               black_cards=args.black_cards))
+        time.sleep(5)
+
+
+if __name__ == "__main__":
+    main()
