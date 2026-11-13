@@ -1,3 +1,6 @@
 *.sh text eol=lf
 src/* text eol=lf
 board-services/* text eol=lf
+kernel/*.py text eol=lf
+kernel/*.c text eol=lf
+kernel/*.h text eol=lf
